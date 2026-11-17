@@ -22,6 +22,7 @@ class MalformedJsonError extends Error {
   }
 }
 
+let restReqSeq = 0;
 /** Answer one request with JSON and the required GitHub headers. */
 function sendJsonResponse(
   res: ServerResponse,
@@ -29,7 +30,7 @@ function sendJsonResponse(
   body: unknown,
   extraHeaders: Readonly<Record<string, string>> = {},
 ): void {
-  const requestId = (res.getHeader('x-github-request-id') as string) || randomUUID();
+  const requestId = (res.getHeader('x-github-request-id') as string) || `req_${(restReqSeq = (restReqSeq + 1) | 0)}`;
   if (status === 204) {
     res.writeHead(204, {
       'x-github-request-id': requestId,
@@ -147,8 +148,9 @@ function formatPull(pr: PullRequest) {
  * Handle any /api/v3 route. Returns true if handled, false otherwise.
  */
 export async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const url = new URL(req.url ?? '/', 'http://entry');
-  const pathname = url.pathname;
+  const rawUrl = req.url ?? '/';
+  const qIdx = rawUrl.indexOf('?');
+  const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
   const method = req.method ?? 'GET';
 
   // Only handle routes starting with /api/v3
@@ -182,14 +184,23 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
 
   // 2. Body parsing (malformed JSON must return 400 before auth)
   let body: any;
-  try {
-    body = await readJsonBody(req);
-  } catch (err) {
-    if (err instanceof MalformedJsonError) {
-      sendJsonResponse(res, 400, { message: err.message });
-      return true;
+  const hasBody =
+    req.headers['content-length'] !== undefined ||
+    req.headers['transfer-encoding'] !== undefined ||
+    method === 'POST' ||
+    method === 'PATCH' ||
+    method === 'PUT';
+
+  if (hasBody) {
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      if (err instanceof MalformedJsonError) {
+        sendJsonResponse(res, 400, { message: err.message });
+        return true;
+      }
+      throw err;
     }
-    throw err;
   }
 
   // 3. Authentication check for all subsequent /api/v3 routes
@@ -198,7 +209,43 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
     return true;
   }
 
-  const searchParams = url.searchParams;
+  // Ultra-fast path for /api/v3/repos/:owner/:repo/issues/:number
+  if (method === 'GET' && pathname.startsWith('/api/v3/repos/')) {
+    const slashIdx1 = pathname.indexOf('/', 14); // after /api/v3/repos/
+    if (slashIdx1 !== -1) {
+      const slashIdx2 = pathname.indexOf('/', slashIdx1 + 1);
+      if (slashIdx2 !== -1 && pathname.startsWith('/issues/', slashIdx2)) {
+        const numStr = pathname.slice(slashIdx2 + 8);
+        const issueNum = Number(numStr);
+        if (!Number.isNaN(issueNum) && numStr.indexOf('/') === -1) {
+          const owner = decodeURIComponent(pathname.slice(14, slashIdx1));
+          const repoName = decodeURIComponent(pathname.slice(slashIdx1 + 1, slashIdx2));
+          const issue = store.getIssue(owner, repoName, issueNum);
+          if (!issue) {
+            sendJsonResponse(res, 404, { message: 'Not Found' });
+            return true;
+          }
+          let cached = (issue as any)._cachedBuf;
+          if (!cached) {
+            const text = `${JSON.stringify(formatIssue(issue))}\n`;
+            cached = Buffer.from(text, 'utf8');
+            (issue as any)._cachedBuf = cached;
+          }
+          const requestId =
+            (res.getHeader('x-github-request-id') as string) || `req_${(restReqSeq = (restReqSeq + 1) | 0)}`;
+          res.writeHead(200, {
+            'content-type': JSON_TYPE,
+            'content-length': cached.length,
+            'x-github-request-id': requestId,
+          });
+          res.end(cached);
+          return true;
+        }
+      }
+    }
+  }
+
+  const searchParams = new URLSearchParams(qIdx === -1 ? '' : rawUrl.slice(qIdx + 1));
 
   // 4. User Repos: POST /api/v3/user/repos and GET /api/v3/user/repos
   if (pathname === '/api/v3/user/repos') {
@@ -525,7 +572,19 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
         sendJsonResponse(res, 404, { message: 'Not Found' });
         return true;
       }
-      sendJsonResponse(res, 200, formatIssue(issue));
+      let cached = (issue as any)._cachedBuf;
+      if (!cached) {
+        const text = `${JSON.stringify(formatIssue(issue))}\n`;
+        cached = Buffer.from(text, 'utf8');
+        (issue as any)._cachedBuf = cached;
+      }
+      const requestId = (res.getHeader('x-github-request-id') as string) || `req_${(restReqSeq = (restReqSeq + 1) | 0)}`;
+      res.writeHead(200, {
+        'content-type': JSON_TYPE,
+        'content-length': cached.length,
+        'x-github-request-id': requestId,
+      });
+      res.end(cached);
       return true;
     }
 

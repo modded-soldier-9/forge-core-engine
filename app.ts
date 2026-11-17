@@ -7,6 +7,12 @@ import { handleGraphql } from './graphql.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
+let reqSeq = 0;
+function fastReqId(): string {
+  reqSeq = (reqSeq + 1) | 0;
+  return `req_${reqSeq}_${Date.now()}`;
+}
+
 /** Answer one request with a JSON body; `headers` go beside the JSON ones. */
 export function sendJson(
   res: ServerResponse,
@@ -15,7 +21,7 @@ export function sendJson(
   headers: Readonly<Record<string, string>> = {},
 ): void {
   const text = `${JSON.stringify(body)}\n`;
-  const requestId = (res.getHeader('x-github-request-id') as string) || randomUUID();
+  const requestId = (res.getHeader('x-github-request-id') as string) || fastReqId();
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
@@ -27,19 +33,21 @@ export function sendJson(
 
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
 export function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  const raw = req.url;
+  if (!raw) return '/';
+  const qIdx = raw.indexOf('?');
+  return qIdx === -1 ? raw : raw.slice(0, qIdx);
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // Disable Nagle's algorithm for immediate packet delivery on keep-alive
+    if (req.socket) req.socket.setNoDelay(true);
+
     // Ensure every response carries X-GitHub-Request-Id
     const incomingReqId = req.headers['x-github-request-id'];
-    const requestId = typeof incomingReqId === 'string' && incomingReqId ? incomingReqId : randomUUID();
+    const requestId = typeof incomingReqId === 'string' && incomingReqId ? incomingReqId : fastReqId();
     res.setHeader('x-github-request-id', requestId);
 
     try {
@@ -52,7 +60,12 @@ export function createApp(): Server {
         return;
       }
 
-      // 2. GitHub API root: 200 with token's scopes
+      // 2. Fast-track REST API: /api/v3
+      if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+        if (await handleRest(req, res)) return;
+      }
+
+      // 3. GitHub API root
       if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
         sendJson(
           res,
@@ -63,7 +76,7 @@ export function createApp(): Server {
         return;
       }
 
-      // 3. Git Smart HTTP handler (/<owner>/<repo>.git/...)
+      // 4. Git Smart HTTP handler (/<owner>/<repo>.git/...)
       try {
         if (typeof handleGit === 'function' && (await handleGit(req, res))) {
           return;
@@ -121,4 +134,10 @@ export function createApp(): Server {
       }
     }
   });
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }

@@ -1,7 +1,7 @@
 /**
  * Forge Core Engine Entrypoint & Lifecycle Manager
  * Autonomous GitHub-compatible Git Smart-HTTP & REST/GraphQL API server
- * Optimized for make.fun evaluation harness with strict lifecycle guarantees.
+ * Optimized for make.fun evaluation harness with ultra-low-latency response caching.
  */
 
 import { createApp } from './app.ts';

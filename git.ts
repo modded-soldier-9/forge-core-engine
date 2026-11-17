@@ -577,28 +577,19 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, stor
   }
 
   const decoder = new PktLineDecoder();
-  let offset = 0;
+  decoder.push(body);
   const commandLines: string[] = [];
-  let flushed = false;
 
-  while (offset < body.length && !flushed) {
-    const chunk = body.subarray(offset, Math.min(body.length, offset + 1024));
-    decoder.push(chunk);
-    offset += chunk.length;
-
-    for (let packet = decoder.next(); packet !== null; packet = decoder.next()) {
-      if (packet.kind === 'flush') {
-        flushed = true;
-        break;
-      }
-      if (packet.kind === 'data') {
-        commandLines.push(packet.payload.toString('utf8'));
-      }
+  for (let packet = decoder.next(); packet !== null; packet = decoder.next()) {
+    if (packet.kind === 'flush') {
+      break;
+    }
+    if (packet.kind === 'data') {
+      commandLines.push(packet.payload.toString('utf8'));
     }
   }
 
-  const remainingBuffered = decoder.takeBuffered();
-  const packBytes = Buffer.concat([remainingBuffered, body.subarray(offset)]);
+  const packBytes = decoder.takeBuffered();
 
   interface Command {
     oldOid: string;
